@@ -1,0 +1,120 @@
+name: "Terraform GitFlow & Security Pipeline"
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+  push:
+    branches:
+      - develop
+      - main
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+
+permissions:
+  id-token: write # Required for AWS OIDC authentication
+  contents: read
+  pull-requests: write # Allows the bot to comment on PRs
+
+jobs:
+  # ----------------------------------------------------
+  # JOB 1: Security & Compliance Scan
+  # ----------------------------------------------------
+  security-scan:
+    name: "Security Scan (Checkov)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        name: Test infrastructure compliance
+        uses: bridgecrewio/checkov-action@master
+        with:
+          framework: terraform
+          output_format: cli
+          soft_fail: false # Pipeline breaks if high-severity issues are found
+
+  # ----------------------------------------------------
+  # JOB 2: Plan & Apply Infrastructure
+  # ----------------------------------------------------
+  terraform:
+    name: "Terraform Operations"
+    needs: security-scan
+    runs-on: ubuntu-latest
+    
+    # Strategy matrix dynamically targets the correct environment/account based on the Git event
+    strategy:
+      matrix:
+        include:
+          # If target branch is develop, plan/apply against DEV
+          - branch: develop
+            environment: dev
+            aws_role: arn:aws:iam::111122223333:role/github-actions-tf-dev
+          # If target branch is main, plan/apply against PROD
+          - branch: main
+            environment: prod
+            aws_role: arn:aws:iam::444455556666:role/github-actions-tf-prod
+
+    # Ensure matrix runs only for the active branch scenario
+    if: github.base_ref == matrix.branch || github.ref_name == matrix.branch
+    
+    defaults:
+      run:
+        working-directory: ./environments/${{ matrix.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Authenticate to AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.aws_role }}
+          aws-region: us-east-1
+          audience: ://amazonaws.com
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # Triggers only on Pull Requests (Dev or Prod)
+      - name: Terraform Plan
+        if: github.event_name == 'pull_request'
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: false
+
+      # Posts the Plan directly into the GitHub PR UI for peer review
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Env: \`${{ matrix.environment }}\` Plan Status: 🚀
+            *Pushed by: @${{ github.actor }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      # Triggers only when code is actually merged/pushed into develop or main
+      - name: Terraform Apply
+        if: github.event_name == 'push'
+        run: terraform apply -auto-approve
+
+
