@@ -1,0 +1,15 @@
+# Local terraform directories
+.terraform/
+
+# State files (since you will use remote backends)
+*.tfstate
+*.tfstate.*
+
+# Crash logs and variables
+crash.log
+*.tfvars
+*.tfvars.json
+
+# Plan outputs
+tfplan
+
